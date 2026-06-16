@@ -22,7 +22,7 @@ LLM 플래너
 `DrumRobot2`가 실제 하드웨어를 상대할 때와 최대한 같은 모양의 입출력 경계를
 사용한다.
 
-더 자세한 문제 분석과 디버깅 기록은 [Trouble shooting.md](<Trouble shooting.md>)에
+더 자세한 문제 분석과 디버깅 기록은 [Trouble shooting.md](<docs/Trouble shooting.md>)에
 정리되어 있다.
 
 ## 핵심 목표
@@ -391,4 +391,4 @@ python3 -m compileall Drum_intheloop/simul.py Drum_intheloop/sil
 4. `sudo ./main.out`을 실행한다.
 5. brain 연결 후 `k`를 입력해 수신 gate를 연다.
 6. gesture를 한 번만 보내고 `current_angles`와 `candump`를 본다.
-7. 같은 gesture를 연속으로 보낼 때 safety error가 나면 [Trouble shooting.md](<Trouble shooting.md>)의 CAN queue/current 동기화 항목을 확인한다.
+7. 같은 gesture를 연속으로 보낼 때 safety error가 나면 [Trouble shooting.md](<docs/Trouble shooting.md>)의 CAN queue/current 동기화 항목을 확인한다.
