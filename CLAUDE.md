@@ -1,3 +1,0 @@
-@AGENTS.md
-@README.md
-@TODO.md
