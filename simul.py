@@ -1,4 +1,6 @@
 import argparse
+import ctypes
+import gc
 import logging
 import os
 import select
@@ -31,10 +33,18 @@ from sil.mapping import (
     STARTUP_DXL_POSE_DEG,
     TMOTOR_SPEC,
     dxl_to_urdf_deg,
+    production_to_urdf_deg,
 )
 from sil.motor_state import NmtState
 from sil.pybullet_backend import PyBulletBackend
-from sil.router import MotorRouter
+from sil.router import (
+    MAX_DT,
+    MAXON_FRICTION_TORQUE,
+    MAXON_REFLECTED_INERTIA,
+    MotorRouter,
+    TORQUE_PHYSICS,
+)
+from sil.pybullet_backend import PHYSICS_TIMESTEP
 
 logging.basicConfig(level=logging.INFO, format="%(levelname)s %(message)s")
 logger = logging.getLogger(__name__)
@@ -53,11 +63,33 @@ class FrameSimulator:
         self.can_buses = list(can_buses)
         self.dxl_path = Path(dxl_path)
         self.feedback_dt = 1.0 / feedback_hz
-        self.backend = PyBulletBackend(urdf_path=urdf_path, mode=mode)
+        self.backend = PyBulletBackend(
+            urdf_path=urdf_path,
+            mode=mode,
+            torque_physics=TORQUE_PHYSICS,
+            reflected_inertia=MAXON_REFLECTED_INERTIA,
+            friction_torque=MAXON_FRICTION_TORQUE,
+        )
         self.router = MotorRouter()
+        self.router_lock = threading.Lock()
         self.nmt_state = NmtState()
         self.bus_map: Dict[str, object] = {}
         self.motor_bus: Dict[str, str] = self._default_motor_bus()
+        # TMotor는 vcan0/vcan1에만, Maxon은 vcan2/vcan3에만 있다.
+        # TMotor 전용 버스는 별도 responder thread가 recv+echo를 맡고,
+        # Maxon 버스는 main loop의 _poll_can이 계속 처리한다.
+        self.tmotor_buses = [
+            can_bus for can_bus, motors in CAN_BUS_MOTORS.items()
+            if can_bus in self.can_buses and len(motors) > 0
+            and all(motor in TMOTOR_SPEC for motor in motors)
+        ]
+        self.maxon_buses = [
+            can_bus for can_bus in self.can_buses if can_bus not in self.tmotor_buses
+        ]
+        self.tmotor_stage: Dict[str, float] = {}
+        self.tmotor_lock = threading.Lock()
+        self.tmotor_stop = threading.Event()
+        self.tmotor_thread: Optional[threading.Thread] = None
         self.dxl_feedback: Dict[int, float] = self._default_dxl_feedback()
         self.dxl_targets: Dict[str, float] = {}
         self.dxl_lock = threading.Lock()
@@ -66,9 +98,11 @@ class FrameSimulator:
         self.dxl_fd: Optional[int] = None
         self.dxl_buffer = b""
         self.last_feedback = 0.0
-        self.last_tmotor_command: Dict[str, float] = {}
         self.last_motion = 0.0
         self.needs_step = False
+        # torque 물리 모드: 벽시계와 고정 timestep을 맞추는 누산기
+        self.last_step = 0.0
+        self.step_accum = 0.0
 
     # 생명주기
     def run(self) -> int:
@@ -77,18 +111,27 @@ class FrameSimulator:
             self.backend.apply_targets(self.router.startup_targets())
             self.backend.step()
             self.last_motion = time.monotonic()
+            self.last_step = self.last_motion
+            # PyBullet 내부 thread는 RT가 아니어야 하므로 backend.start() 이후,
+            # 우리 thread 생성 이전에 RT 정책을 건다(이후 만든 thread가 정책을 상속).
+            self._apply_realtime()
             self._open_can_buses()
             self._open_dxl()
             self._start_dxl_thread()
+            self._start_tmotor_thread()
+            # warmup이 끝난 시점에 살아있는 객체를 freeze해 GC 스캔 부담을 줄인다.
+            self._freeze_gc()
 
             while True:
                 self._poll_can()
                 self._apply_dxl_targets()
+                self._apply_tmotor_targets()
                 self._advance_motion()
-                if self.needs_step:
+                if TORQUE_PHYSICS:
+                    self._step_torque_physics()
+                elif self.needs_step:
                     self.backend.step()
                     self.needs_step = False
-                self._send_tmotor_idle_feedback()
                 time.sleep(0.0005)
         except KeyboardInterrupt:
             return 0
@@ -96,6 +139,11 @@ class FrameSimulator:
             self.close()
 
     def close(self) -> None:
+        self.tmotor_stop.set()
+        if self.tmotor_thread is not None:
+            self.tmotor_thread.join(timeout=0.5)
+            self.tmotor_thread = None
+
         self.dxl_stop.set()
         if self.dxl_thread is not None:
             self.dxl_thread.join(timeout=0.5)
@@ -113,6 +161,52 @@ class FrameSimulator:
 
         self.bus_map.clear()
         self.backend.close()
+
+    # 실시간 hardening: 비-RT Python에서 feedback 멈춤 원인을 최대한 줄인다.
+    # 비-RT 커널에서는 deschedule을 완전히 없애진 못하므로 best-effort이며,
+    # 권한이 없으면 각 항목을 조용히 건너뛴다. (SCHED_FIFO/mlockall은 root 필요)
+    def _apply_realtime(self) -> None:
+        # GIL: 전환 검사 주기를 5ms→0.5ms로 줄여, main이 순수 Python에 갇혀도
+        # echo thread가 더 빨리 GIL을 넘겨받게 한다.
+        sys.setswitchinterval(0.0005)
+
+        applied = []
+        # OS 스케줄링: SCHED_FIFO는 normal(SCHED_OTHER) 프로세스(brain/TTS 등)에 의한
+        # deschedule을 막는다. 우리 loop는 매 iteration sleep으로 양보하므로 머신을 굶기지 않는다.
+        try:
+            param = os.sched_param(10)
+            os.sched_setscheduler(0, os.SCHED_FIFO, param)
+            applied.append("SCHED_FIFO(10)")
+        except (PermissionError, OSError, AttributeError):
+            try:
+                os.nice(-10)
+                applied.append("nice(-10)")
+            except (PermissionError, OSError):
+                pass
+
+        # 메모리 page를 RAM에 고정해 page fault/swap로 인한 멈춤을 차단한다.
+        try:
+            libc = ctypes.CDLL("libc.so.6", use_errno=True)
+            MCL_CURRENT = 1
+            MCL_FUTURE = 2
+            if libc.mlockall(MCL_CURRENT | MCL_FUTURE) == 0:
+                applied.append("mlockall")
+        except Exception:
+            pass
+
+        if applied:
+            logger.info("[SIL] realtime hardening: %s", ", ".join(applied))
+        else:
+            logger.info("[SIL] realtime hardening: none (권한 없음? sudo로 실행 필요)")
+
+    # GC 멈춤 완화: warmup 후 살아있는 객체를 permanent gen으로 옮겨(freeze)
+    # 이후 수집 스캔 대상에서 빼, 매 collection의 stop-the-world 시간을 줄인다.
+    # collector 자체는 켜둔 채라 순환 참조 누수 위험은 없다.
+    # (gc.disable()은 누수 위험 때문에 되돌렸다.)
+    def _freeze_gc(self) -> None:
+        gc.collect()
+        gc.freeze()
+        logger.info("[SIL] gc frozen after warmup (collector still on)")
 
     # 장치 초기화
     def _default_motor_bus(self) -> Dict[str, str]:
@@ -158,10 +252,12 @@ class FrameSimulator:
             self._poll_dxl()
             time.sleep(0.0002)
 
-    # CAN 프레임 처리 반복
+    # CAN 프레임 처리 반복 (Maxon 버스 전용; TMotor 버스는 _tmotor_loop가 맡는다)
     def _poll_can(self) -> None:
-        for can_bus, bus_obj in self.bus_map.items():
-            latest_tmotor: Dict[str, float] = {}
+        for can_bus in self.maxon_buses:
+            bus_obj = self.bus_map.get(can_bus)
+            if bus_obj is None:
+                continue
 
             while True:
                 frame = bus_obj.recv(timeout=0.0)
@@ -189,22 +285,11 @@ class FrameSimulator:
                         bus_obj.send(reply)
                     continue
 
-                targets = self.router.route_can(command)
+                with self.router_lock:
+                    targets = self.router.route_can(command)
                 if targets:
                     self.backend.apply_targets(targets)
                     self.needs_step = True
-
-                    # TMotor 실제 장치 모델:
-                    # CAN queue를 비우는 동안 모터별 최신 target만 남겼다가 echo feedback으로 되돌려준다.
-                    if command.motor in TMOTOR_SPEC:
-                        for urdf_deg in targets.values():
-                            latest_tmotor[command.motor] = urdf_deg
-
-            if latest_tmotor:
-                now = time.monotonic()
-                for motor, urdf_deg in latest_tmotor.items():
-                    self.last_tmotor_command[motor] = now
-                    self._send_motor_feedback(motor, can_bus, urdf_deg)
 
     # DXL 패킷 처리 반복
     def _poll_dxl(self) -> None:
@@ -309,36 +394,113 @@ class FrameSimulator:
         dt = now - self.last_motion
         self.last_motion = now
 
-        targets = self.router.advance(dt)
+        with self.router_lock:
+            targets = self.router.advance(dt)
         if targets:
             self.backend.apply_targets(targets)
             self.needs_step = True
 
-    def _send_tmotor_idle_feedback(self) -> None:
-        # TMotor discovery/idle 모델:
-        # DrumRobot2가 초기 연결 확인을 할 수 있도록 명령 전 TMotor에만 200Hz status를 유지한다.
-        # command를 받은 뒤에는 target echo만 실제 feedback source로 둔다.
+    # torque 물리 모드: 흐른 벽시계만큼 고정 timestep으로 PyBullet을 적분한다.
+    # 매 substep마다 출력단 토크를 다시 인가한다 (TORQUE_CONTROL은 step 단위라).
+    def _step_torque_physics(self) -> None:
+        now = time.monotonic()
+        elapsed = now - self.last_step
+        self.last_step = now
+
+        # spiral of death 방지: 한 번에 따라잡을 시간을 MAX_DT로 제한한다.
+        self.step_accum = min(self.step_accum + elapsed, MAX_DT)
+
+        while self.step_accum >= PHYSICS_TIMESTEP:
+            with self.router_lock:
+                joint_torques = self.router.torque_targets()
+            self.backend.apply_joint_torques(joint_torques)
+            self.backend.step()
+            self.step_accum -= PHYSICS_TIMESTEP
+
+    # TMotor responder thread
+    # PyBullet step에 막히는 main loop와 달리, TMotor 버스(vcan0/vcan1)의 recv+echo를
+    # 전용 thread로 분리해 DrumRobot2의 current feedback이 step 지연에도 신선하게 유지되도록 한다.
+    def _start_tmotor_thread(self) -> None:
+        if not self.tmotor_buses:
+            return
+
+        self.tmotor_thread = threading.Thread(target=self._tmotor_loop, daemon=True)
+        self.tmotor_thread.start()
+
+    def _tmotor_loop(self) -> None:
+        while not self.tmotor_stop.is_set():
+            self._drain_tmotor_buses()
+            self._emit_tmotor_feedback()
+            time.sleep(0.0002)
+
+    # TMotor 버스를 비우면서, 들어온 명령을 즉시 echo하고 PyBullet 반영용으로 staging한다.
+    def _drain_tmotor_buses(self) -> None:
+        staged: Dict[str, float] = {}
+        for can_bus in self.tmotor_buses:
+            bus_obj = self.bus_map.get(can_bus)
+            if bus_obj is None:
+                continue
+
+            while True:
+                frame = bus_obj.recv(timeout=0.0)
+                if frame is None:
+                    break
+
+                command = decode_can_frame(frame)
+                if command is None:
+                    continue
+
+                motor = command.motor
+                if motor is None or motor not in TMOTOR_SPEC:
+                    continue
+
+                self.motor_bus[motor] = can_bus
+                with self.router_lock:
+                    targets = self.router.route_can(command)
+
+                # position 명령만 즉시 echo한다. velocity 명령은 route가 None을 주고,
+                # advance()가 적분한 motor_target를 _emit_tmotor_feedback이 echo한다.
+                if targets:
+                    staged.update(targets)
+                    for urdf_deg in targets.values():
+                        self._send_motor_feedback(motor, can_bus, urdf_deg)
+
+        if staged:
+            with self.tmotor_lock:
+                self.tmotor_stage.update(staged)
+
+    # TMotor 독립 heartbeat: 명령이 잠시 없거나 velocity 적분 중이어도 current를 유지한다.
+    # source는 router.motor_target 하나로 통일한다(position/velocity/discovery 모두 커버).
+    def _emit_tmotor_feedback(self) -> None:
         now = time.monotonic()
         if now - self.last_feedback < self.feedback_dt:
             return
-
-        state = self.backend.read_joint_states()
-        for motor, can_bus in self.motor_bus.items():
-            if motor not in TMOTOR_SPEC:
-                continue
-
-            if motor in self.last_tmotor_command:
-                continue
-
-            joint_name = PRODUCTION_TO_URDF_JOINT.get(motor)
-            if joint_name is None:
-                continue
-
-            urdf_deg = state.get(joint_name)
-            if urdf_deg is not None:
-                self._send_motor_feedback(motor, can_bus, urdf_deg)
-
         self.last_feedback = now
+
+        for motor in TMOTOR_SPEC:
+            can_bus = self.motor_bus.get(motor)
+            if can_bus not in self.tmotor_buses:
+                continue
+
+            with self.router_lock:
+                joint_deg = self.router.motor_target.get(motor)
+            if joint_deg is None:
+                continue
+
+            urdf_deg = production_to_urdf_deg(motor, joint_deg)
+            self._send_motor_feedback(motor, can_bus, urdf_deg)
+
+    # TMotor thread가 staging한 target을 main thread에서 PyBullet에 반영한다.
+    def _apply_tmotor_targets(self) -> None:
+        with self.tmotor_lock:
+            if not self.tmotor_stage:
+                return
+
+            targets = dict(self.tmotor_stage)
+            self.tmotor_stage.clear()
+
+        self.backend.apply_targets(targets)
+        self.needs_step = True
 
     def _send_maxon_sync_feedback(self, can_bus: str) -> None:
         # Maxon 실제 장치 모델:

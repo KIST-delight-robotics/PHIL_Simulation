@@ -1,5 +1,6 @@
+import xml.etree.ElementTree as ET
 from pathlib import Path
-from typing import Dict, Optional, Tuple
+from typing import Dict, List, Optional, Tuple
 
 from .colors import CHARCOAL, SILVER
 
@@ -183,6 +184,14 @@ def urdf_to_production_deg(name: str, urdf_deg: float) -> float:
     return sign * (urdf_deg - bias) + reference * (1.0 - sign)
 
 
+def production_to_urdf_torque(name: str, torque: float) -> float:
+    # 토크는 부호 방향만 URDF 축에 맞추면 된다 (reference/bias offset은 무관).
+    transform = PRODUCTION_TO_URDF_CAN_TRANSFORM.get(name)
+    if transform is None:
+        return torque
+    return transform["sign"] * torque
+
+
 def motor_to_joint_deg(name: str, motor_rad: float) -> float:
     spec = motor_spec(name)
     if spec is None:
@@ -220,3 +229,115 @@ def math_rad(value_deg: float) -> float:
 
 def math_deg(value_rad: float) -> float:
     return value_rad * 180.0 / 3.141592653589793
+
+
+# 부하 관성 (URDF link inertia 기반)
+# URDF에 해당 joint가 없을 때(예: 이 URDF에 pedal joint 없음) 쓰는 fallback.
+DEFAULT_LOAD_INERTIA = 1.5e-3  # kg·m², 추정값 (URDF에서 못 가져올 때만)
+
+_inertia_cache: Dict[str, float] = {}
+_urdf_root: Optional[ET.Element] = None
+
+
+def joint_load_inertia(name: str) -> float:
+    """production motor가 구동하는 URDF link의 관절축 기준 관성(kg·m²).
+
+    URDF inertia는 link COM 기준이라, 평행축 정리로 관절 원점으로 옮긴 뒤
+    관절 축 성분만 취한다. joint나 inertial이 없으면 DEFAULT_LOAD_INERTIA.
+    """
+    if name in _inertia_cache:
+        return _inertia_cache[name]
+
+    joint_name = PRODUCTION_TO_URDF_JOINT.get(name)
+    inertia = _read_joint_inertia(joint_name) if joint_name is not None else None
+    if inertia is None:
+        inertia = DEFAULT_LOAD_INERTIA
+    _inertia_cache[name] = inertia
+    return inertia
+
+
+def _urdf_element() -> Optional[ET.Element]:
+    global _urdf_root
+    if _urdf_root is not None:
+        return _urdf_root
+    if not DEFAULT_URDF_PATH.exists():
+        return None
+    _urdf_root = ET.parse(str(DEFAULT_URDF_PATH)).getroot()
+    return _urdf_root
+
+
+def _read_joint_inertia(joint_name: str) -> Optional[float]:
+    root = _urdf_element()
+    if root is None:
+        return None
+
+    axis: List[float] = [0.0, 0.0, 1.0]
+    child_link: Optional[str] = None
+    for joint in root.findall("joint"):
+        if joint.get("name") != joint_name:
+            continue
+        child = joint.find("child")
+        if child is not None:
+            child_link = child.get("link")
+        axis_tag = joint.find("axis")
+        if axis_tag is not None and axis_tag.get("xyz") is not None:
+            axis = [float(value) for value in axis_tag.get("xyz").split()]
+        break
+
+    if child_link is None:
+        return None
+
+    for link in root.findall("link"):
+        if link.get("name") != child_link:
+            continue
+        inertial = link.find("inertial")
+        if inertial is None:
+            return None
+        return _axis_inertia(inertial, axis)
+
+    return None
+
+
+def _axis_inertia(inertial: ET.Element, axis: List[float]) -> Optional[float]:
+    mass_tag = inertial.find("mass")
+    tensor_tag = inertial.find("inertia")
+    origin_tag = inertial.find("origin")
+    if mass_tag is None or tensor_tag is None:
+        return None
+
+    mass = float(mass_tag.get("value"))
+    com: List[float] = [0.0, 0.0, 0.0]
+    if origin_tag is not None and origin_tag.get("xyz") is not None:
+        com = [float(value) for value in origin_tag.get("xyz").split()]
+
+    ixx = float(tensor_tag.get("ixx"))
+    iyy = float(tensor_tag.get("iyy"))
+    izz = float(tensor_tag.get("izz"))
+    ixy = float(tensor_tag.get("ixy", 0.0))
+    ixz = float(tensor_tag.get("ixz", 0.0))
+    iyz = float(tensor_tag.get("iyz", 0.0))
+
+    # COM 기준 텐서를 관절 원점으로 평행 이동: I_P = I_com + m(|r|^2 E - r r^T)
+    rx, ry, rz = com[0], com[1], com[2]
+    r_sq = rx * rx + ry * ry + rz * rz
+    pxx = ixx + mass * (r_sq - rx * rx)
+    pyy = iyy + mass * (r_sq - ry * ry)
+    pzz = izz + mass * (r_sq - rz * rz)
+    pxy = ixy - mass * rx * ry
+    pxz = ixz - mass * rx * rz
+    pyz = iyz - mass * ry * rz
+
+    # 관절 축 단위벡터 기준 관성: a^T I_P a
+    norm = (axis[0] * axis[0] + axis[1] * axis[1] + axis[2] * axis[2]) ** 0.5
+    if norm == 0.0:
+        return None
+    ax, ay, az = axis[0] / norm, axis[1] / norm, axis[2] / norm
+    inertia = (
+        pxx * ax * ax
+        + pyy * ay * ay
+        + pzz * az * az
+        + 2.0 * pxy * ax * ay
+        + 2.0 * pxz * ax * az
+        + 2.0 * pyz * ay * az
+    )
+    return inertia

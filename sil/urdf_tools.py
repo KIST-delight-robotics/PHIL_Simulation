@@ -23,8 +23,6 @@ PACKAGE_PREFIX = "package://drumrobot_RL_urdf/"
 # - 화면만 이상해 보일 때도 visual이 같이 바뀌고
 # - collision/AABB도 같이 바뀝니다.
 # - joint 축 위치 자체가 틀린 경우는 이 테이블이 아니라 URDF joint origin 문제입니다.
-#
-# 현재 2차 가설:
 # - 상완/하완 링크의 로컬 프레임이 둘레 방향으로 뒤집혀 있어
 #   연결부 bracket이 양팔 모두 바깥을 향해 보입니다.
 # - x축 180도 회전만 주면 mesh가 조인트 원점 기준으로 위아래가 뒤집혀

@@ -1,5 +1,27 @@
 # Change Log
 
+## 2026-06-19
+- 14:52 KST (UTC+9) — torque 모드에 PyBullet 실제 동역학 경로 추가 (플래그로 선택, 기본 off)
+  - 수정 파일: `sil/router.py`, `sil/mapping.py`, `sil/pybullet_backend.py`, `simul.py`
+  - 메모: `router.TORQUE_PHYSICS` 플래그 추가. False(기본)면 기존 `_advance_torque` 1D 손적분 + resetJointState 그대로라 동작 불변. True면 router는 torque 관절을 적분하지 않고 `torque_targets()`로 출력단 토크(Nm, stall→기어×효율→peak clamp, URDF 부호 적용)만 만들고, `PyBulletBackend.apply_joint_torques()`가 `TORQUE_CONTROL`로 인가→`stepSimulation`이 물리 적분. backend는 첫 torque 명령 때 `_enable_torque_joint`로 기본 속도모터 끄고(force=0) datasheet 반사 관성(`MAXON_REFLECTED_INERTIA`)을 link Izz에 더함(Bullet엔 armature 칸 없음). URDF link 관성은 PyBullet이 이미 보유하므로 부하 관성은 따로 안 넣음. 무부하 전류 기반 마찰은 측정 속도 반대로 차감. 피드백은 기존 `getJointState`(SYNC TPDO) 경로 그대로라 자동 반영. 물리 모드는 `simul._step_torque_physics`가 벽시계 누산기로 고정 timestep(1/240) substep을 돌려 실시간에 맞춤(누산 상한 MAX_DT).
+  - 주의: 물리 모드 미검증. wrist는 Maxon이라 feedback이 main loop step 타이밍에 묶임 → 풀 부하에서 safety trip 재발 가능. 라이브로 timestep/스텝 cadence 튜닝 필요. 반사 관성 Izz 합산은 wrist 회전축이 link Z라는 가정의 근사.
+- 14:16 KST (UTC+9) — Maxon torque 모드 동특성을 datasheet 기반으로 재작성
+  - 수정 파일: `sil/router.py`, `sil/mapping.py`
+  - 메모: 기존 `_advance_torque`는 `MAXON_TORQUE_GAIN=3.0`/`MAXON_TORQUE_DAMPING=8.0`/`MAXON_VELOCITY_LIMIT=720` 같은 근거 없는 임의 상수로 1차 적분하던 가짜 모델이었다. `docs/Maxon_wrist_motor.pdf`(DCX22L GB KL 48V + GPX22HP 35:1 + ENX16 1024)에서 토크 상수 45.2 mNm/A, stall 294 mNm, 무부하 전류 16.2 mA, 무부하 속도 10100 rpm, 로터 관성 8.85 gcm², 기어 효율 75%, 기어 순간 토크 3 Nm, 기어 관성 1.31 gcm²를 뽑아 router 상수로 대체. 모델: 모터축 토크를 stall로 clamp → 기어비×효율로 출력단 토크 환산 후 3 Nm로 clamp → 무부하 전류 기반 마찰 차감 → `accel = T_net / J_total`로 적분, 속도는 무부하 속도 출력단 환산값(1731 deg/s)으로 clamp. 부하 관성은 datasheet에 없으므로 `mapping.joint_load_inertia()`가 URDF link inertia를 평행축 정리로 관절축 기준으로 환산해 가져온다(wrist=1.444e-3 kg·m², URDF). pedal joint는 이 URDF에 없어 foot는 `DEFAULT_LOAD_INERTIA` fallback. `MAX_DT`는 적분 안정용이라 유지.
+- 11:44 KST (UTC+9) — `gc.disable()` 되돌림(freeze는 유지)
+  - 수정 파일: `simul.py`
+  - 메모: RT hardening + responder thread로도 SIL safety 트립이 완전히 사라지지 않아(잔여는 비-RT 커널 deschedule + echo의 구조적 ≥1 step 지연), 메모리 누수 위험만 있고 효과가 불확실한 `gc.disable()`을 제거. `gc.collect()`+`gc.freeze()`는 누수 위험 없이 GC 스캔 부담만 줄이므로 유지. `sys.setswitchinterval`/`SCHED_FIFO`/`mlockall`은 무해/저위험이라 유지. 트립 자체의 최종 종결은 컨트롤러측 vcan 게이트 완화(B)로 예정.
+
+## 2026-06-18
+- 17:29 KST (UTC+9) — SIL feedback 멈춤 원인(GIL/GC/deschedule)에 best-effort 실시간 hardening 추가
+  - 수정 파일: `simul.py`
+  - 메모: responder thread만으로 못 막는 잔여 트립(프로세스 deschedule·GC·GIL 경합)을 줄이기 위해 `run()` warmup 직후 `_apply_realtime()`, loop 진입 전 `_freeze_gc()` 추가. GIL: `sys.setswitchinterval(0.0005)`(5ms→0.5ms)로 echo thread가 GIL을 더 빨리 넘겨받게. 우선순위: `os.sched_setscheduler(SCHED_FIFO, 10)`(실패 시 `nice(-10)` 폴백) + `mlockall`로 deschedule/page fault 멈춤 차단. RT 정책은 PyBullet 내부 thread 생성 이후·우리 thread 생성 이전에 걸어 echo/dxl thread만 정책을 상속. GC: warmup 후 `gc.freeze()`+`gc.disable()`로 stop-the-world 제거(ref counting 유지). 모두 best-effort라 권한 없으면 조용히 skip. SCHED_FIFO/mlockall은 root 필요 → simul.py를 sudo로 실행해야 실제 적용됨.
+  - 주의: `gc.disable()`로 순환 참조 누수 가능 → 장시간 실행 시 메모리 증가 관찰 필요. 비-RT 커널이라 deschedule을 완전히 없애진 못함(트립이 남으면 컨트롤러측 (A)/(B) 게이트 완화로 마무리).
+- 17:05 KST (UTC+9) — TMotor recv+echo를 전용 responder thread로 분리해 SIL safety current 신선도 개선
+  - 수정 파일: `simul.py`
+  - 메모: `safetyCheckSendT`가 SIL에서 간헐 트립하던 원인은 main loop가 PyBullet `stepSimulation`에 막혀 TMotor echo feedback이 지연→DrumRobot2 current가 stale해지는 것. TMotor 전용 버스(vcan0/vcan1)의 recv+echo를 step에 안 막히는 별도 thread(`_tmotor_loop`)로 분리. 명령은 즉시 echo하고 PyBullet 반영은 staging→main loop에서 처리. heartbeat feedback source는 `router.motor_target` 하나로 통일(position/velocity/discovery 공통). Maxon 버스(vcan2/vcan3)와 SYNC TPDO는 PyBullet 읽기 때문에 main loop에 그대로 둠. 라우터가 stateful이라 `route_can`/`advance`/`motor_target` 접근에 `router_lock`을 둠(GIL 위 sub-µs 임계구역이라 지연 영향 무시 가능, dict iterate 중 mutate 크래시 방지가 목적). 기존 `_send_tmotor_idle_feedback`/`last_tmotor_command` 제거.
+  - 후속: brain까지 붙인 풀 부하에서 R_arm 계열 트립이 사라지는지 확인. 안 되면 컨트롤러측 (A)/(B) 게이트 완화 검토.
+
 ## 2026-06-16
 - 15:00 KST (UTC+9) — 레포 분할 준비: 인터페이스 계약 단일 소스와 분리-레포 헤더 추가
   - 수정 파일: 신규 `CONTRACTS.md` / 수정 `AGENTS.md`
