@@ -49,6 +49,11 @@ from sil.pybullet_backend import PHYSICS_TIMESTEP
 logging.basicConfig(level=logging.INFO, format="%(levelname)s %(message)s")
 logger = logging.getLogger(__name__)
 
+# [우회] SIL에서만 목이 팔보다 컨트롤러 lookahead(~1.12s)만큼 앞서 보이는 현상 보정.
+# 컨트롤러/하드웨어는 그대로 두고, SIL에서 목(DXL) goal 적용을 이만큼 지연시켜 팔과 시작점을 맞춘다.
+# 곡 무관 고정값으로 측정됨(TIM/BI/TY_short 모두 ~1.13s). 필요시 튜닝.
+NECK_DELAY_S = 2.4
+
 
 # 시뮬레이터 본체
 class FrameSimulator:
@@ -92,6 +97,7 @@ class FrameSimulator:
         self.tmotor_thread: Optional[threading.Thread] = None
         self.dxl_feedback: Dict[int, float] = self._default_dxl_feedback()
         self.dxl_targets: Dict[str, float] = {}
+        self.dxl_delay_q = []  # [우회] (apply_time, dxl_id, goal) 시간순 지연 큐
         self.dxl_lock = threading.Lock()
         self.dxl_stop = threading.Event()
         self.dxl_thread: Optional[threading.Thread] = None
@@ -103,6 +109,10 @@ class FrameSimulator:
         # torque 물리 모드: 벽시계와 고정 timestep을 맞추는 누산기
         self.last_step = 0.0
         self.step_accum = 0.0
+        # [TIMING] 측정용 디버그 로그(neck/arm 적용 시각+각도). 재시작마다 새 파일. 측정 끝나면 제거.
+        self.timing_file = None
+        self.timing_t0 = 0.0
+        self.timing_last: Dict[str, float] = {}
 
     # 생명주기
     def run(self) -> int:
@@ -112,6 +122,8 @@ class FrameSimulator:
             self.backend.step()
             self.last_motion = time.monotonic()
             self.last_step = self.last_motion
+            self.timing_t0 = self.last_motion
+            self.timing_file = self._open_timing_log()  # [TIMING] 재시작마다 새 파일
             # PyBullet 내부 thread는 RT가 아니어야 하므로 backend.start() 이후,
             # 우리 thread 생성 이전에 RT 정책을 건다(이후 만든 thread가 정책을 상속).
             self._apply_realtime()
@@ -124,6 +136,7 @@ class FrameSimulator:
 
             while True:
                 self._poll_can()
+                self._release_delayed_dxl()
                 self._apply_dxl_targets()
                 self._apply_tmotor_targets()
                 self._advance_motion()
@@ -139,6 +152,9 @@ class FrameSimulator:
             self.close()
 
     def close(self) -> None:
+        if self.timing_file is not None:
+            self.timing_file.close()
+            self.timing_file = None
         self.tmotor_stop.set()
         if self.tmotor_thread is not None:
             self.tmotor_thread.join(timeout=0.5)
@@ -290,6 +306,7 @@ class FrameSimulator:
                 if targets:
                     self.backend.apply_targets(targets)
                     self.needs_step = True
+                    self._log_apply("maxon", targets)  # 손목/발 등 position 경로
 
     # DXL 패킷 처리 반복
     def _poll_dxl(self) -> None:
@@ -346,9 +363,24 @@ class FrameSimulator:
         if command.kind == "sync_write":
             goal_deg = dxl_goal_deg(command.data)
             if goal_deg is not None:
-                self.dxl_feedback[command.dxl_id] = goal_deg
-                self._stage_dxl_target(command.dxl_id, goal_deg)
+                # [우회] 즉시 적용하지 않고 NECK_DELAY_S 뒤에 적용되도록 큐에 넣는다.
+                with self.dxl_lock:
+                    self.dxl_delay_q.append((time.monotonic() + NECK_DELAY_S, command.dxl_id, goal_deg))
             return
+
+    # [우회] 지연 큐에서 도착시간 지난 목 goal을 꺼내 staging (FIFO/시간순이라 prefix만 꺼냄).
+    def _release_delayed_dxl(self) -> None:
+        now = time.monotonic()
+        with self.dxl_lock:
+            queue = self.dxl_delay_q
+            count = 0
+            while count < len(queue) and queue[count][0] <= now:
+                count += 1
+            ready = queue[:count]
+            del queue[:count]
+        for _, dxl_id, goal_deg in ready:
+            self.dxl_feedback[dxl_id] = goal_deg
+            self._stage_dxl_target(dxl_id, goal_deg)
 
     def _stage_dxl_target(self, dxl_id: int, goal_deg: float) -> None:
         motor = DXL_MOTORS.get(dxl_id)
@@ -377,6 +409,36 @@ class FrameSimulator:
                 return
             view = view[sent:]
 
+    # [TIMING] 재시작마다 apply_timing_N.csv 새로 연다(덮어쓰기 방지).
+    def _open_timing_log(self):
+        base = Path(__file__).resolve().parent
+        for n in range(1, 1000):
+            path = base / f"apply_timing_{n}.csv"
+            if not path.exists():
+                handle = open(path, "w")
+                handle.write("elapsed_s,stream,joint,deg\n")
+                logger.info("[TIMING] apply log -> %s", path)
+                return handle
+        return None
+
+    # [TIMING] neck/arm 적용 시각+각도를 long-format으로 기록(둘 다 main loop라 락 불필요).
+    # 변화 0.05deg 이상일 때만 기록(고빈도 flush가 타이밍 흔드는 것 방지).
+    def _log_apply(self, stream: str, targets: Dict[str, float]) -> None:
+        if self.timing_file is None:
+            return
+        elapsed = time.monotonic() - self.timing_t0
+        wrote = False
+        for joint, deg in targets.items():
+            key = stream + "|" + joint
+            last = self.timing_last.get(key)
+            if last is not None and abs(deg - last) < 0.05:
+                continue
+            self.timing_last[key] = deg
+            self.timing_file.write(f"{elapsed:.4f},{stream},{joint},{deg:.3f}\n")
+            wrote = True
+        if wrote:
+            self.timing_file.flush()
+
     def _apply_dxl_targets(self) -> None:
         with self.dxl_lock:
             if not self.dxl_targets:
@@ -387,6 +449,7 @@ class FrameSimulator:
 
         self.backend.apply_targets(targets)
         self.needs_step = True
+        self._log_apply("neck", targets)
 
     # 모션/피드백 반복
     def _advance_motion(self) -> None:
@@ -399,6 +462,7 @@ class FrameSimulator:
         if targets:
             self.backend.apply_targets(targets)
             self.needs_step = True
+            self._log_apply("arm", targets)  # velocity 적분으로 적용되는 팔(+허리)
 
     # torque 물리 모드: 흐른 벽시계만큼 고정 timestep으로 PyBullet을 적분한다.
     # 매 substep마다 출력단 토크를 다시 인가한다 (TORQUE_CONTROL은 step 단위라).
@@ -501,6 +565,7 @@ class FrameSimulator:
 
         self.backend.apply_targets(targets)
         self.needs_step = True
+        self._log_apply("arm", targets)  # position 모드 팔(있을 경우)
 
     def _send_maxon_sync_feedback(self, can_bus: str) -> None:
         # Maxon 실제 장치 모델:

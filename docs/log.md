@@ -1,5 +1,16 @@
 # Change Log
 
+## 2026-06-23
+- 11:27 KST (UTC+9) — [조사 종료/revert] "SIL에서만 목이 팔보다 먼저 까닥" 장기 조사 마무리, 실험 코드 전부 되돌림
+  - 수정 파일: (revert) `simul.py`, `sil/decoder.py` — git checkout으로 HEAD 복원
+  - 메모: 결론 = 목 선행은 **명령 스트림에 내재**. `genDxlTrajectory`가 박자/intensity 기반 head nod를 타격 여부와 무관하게 생성해, 인트로에 팔은 ready 유지하는데 목만 먼저 끄덕임. 같은 sim clock 실측에서 목이 팔보다 ~1.1s 선행(팔은 31.8s엔 −89.9° 고정→32.9s부터 시작), 팔은 자기 명령 τ≈0 추종 → 컨트롤러가 그 구간 팔을 붙들고 목을 끄덕인 것(=명령). 앞선 가설들은 모두 실측 반박: (1) syncRead blocking(빼도 동일), (2) velocity 적분 lag(팔 τ≈0), (3) DXL teleport(teleport→프로파일 보간으로 바꿔도 선행 그대로). 단 **하드웨어에선 인트로에 목이 안 까닥임** — 같은 명령인데 다른 이유 미해결(추정: 실서보 부하/데드밴드로 미세 nod가 안 보임). 깔끔한 해결책 없어 보류. 그래서 이번 세션 실험(타임스탬프 디버그 로그 + DXL 모션 모델: `dxl_profile_s`/`dxl_chase`/`dxl_trapezoid`/`_advance_dxl`)을 전부 revert. (`apply_timing.csv` 산출물도 삭제.) 컨트롤러 `syncRead` 변경도 앞서 revert됨.
+  - 향후 옵션(빠른 우회): 연주 시작 시 목을 N초 홀드해 팔과 시작점 맞추기. 인트로 길이가 곡마다 달라 근사이며, 필요해지면 컨트롤러(`genDxlTrajectory`/play 시작부)에서 인트로 구간 DXL을 rest로 덮는 식으로 추가.
+
+## 2026-06-22
+- 10:42 KST (UTC+9) — head_tilt 매핑 부호 반전 되돌림 (06-19 변경 revert)
+  - 수정 파일: `sil/mapping.py`
+  - 메모: 06-19에 tilt를 `dxl_deg - 90.0`으로 뒤집었으나, SIL 매핑은 연주/상호작용 두 경로에 공통 적용되므로 잘못된 레이어였다. 연주(ground truth)가 반대로 깨지고 상호작용만 맞아 보이던 현상의 원인. SIL은 `90.0 - dxl_deg`(연주/하드웨어 관례)로 원복하고, 실제 불일치는 controller 쪽 제스처 하드코딩 숫자에서 잡았다(`DrumRobot2/src/AgentAction.cpp`). `dxl_to_urdf_deg`/`urdf_to_dxl_deg` 모두 `90.0 - x`로 환원.
+
 ## 2026-06-19
 - 14:52 KST (UTC+9) — torque 모드에 PyBullet 실제 동역학 경로 추가 (플래그로 선택, 기본 off)
   - 수정 파일: `sil/router.py`, `sil/mapping.py`, `sil/pybullet_backend.py`, `simul.py`
