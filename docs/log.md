@@ -1,5 +1,15 @@
 # Change Log
 
+## 2026-06-25
+- 11:25 KST (UTC+9) — 드럼패드 좌표 파일을 SIL 내부로 vendoring해 컨트롤러 트리 의존성 제거
+  - 수정 파일: `sil/visuals.py`, `assets/drum_position.txt`(신규)
+  - 메모: `_load_drum_positions()`가 참조하던 `../../DrumRobot2/include/drum/drum_position.txt`는 이미 죽은 경로였음 — `DrumRobot2`는 `Phil-drum-robot/drumrobot_server`로 재구성됐고 거기엔 `drum_position.txt`가 없음(현 컨트롤러는 `config/drum_coordinate.json`을 다른 좌표계로 사용). 그래서 그동안 패드가 아예 안 그려지고 있었음(`[]` 반환→early return). 파서가 원래 대상으로 삼던 동일 파일(`legacy/DrumRobot2/include/drum/drum_position.txt`)을 `assets/drum_position.txt`로 복사하고 로더를 `parents[1]/assets/...` 로컬 경로로 변경. 6행(R xyz, L xyz)×10악기열, z-up world frame. 스모크: 60값 파싱·패드 10개(idx 8 skip) 정상, `compileall` 통과. 캐비엇: vendoring한 좌표는 구 드럼 배치라 현 `drum_coordinate.json`과는 다름(시각 참조용이라 동작에는 영향 없음). 현 좌표에 맞추려면 JSON 파싱 + 프레임 변환이 별도로 필요.
+
+## 2026-06-24
+- 15:15 KST (UTC+9) — SIL 가상 CAN 인터페이스 이름을 `vcan0..3` → `can0..3`으로 변경 (디바이스 타입은 vcan 유지)
+  - 수정 파일: `setup_sil.sh`, `sil/mapping.py`, `simul.py`
+  - 메모: 새 컨트롤러(`Phil-drum-robot/drumrobot_server`)의 `can_interface.cpp`는 인터페이스 이름이 `can`으로 시작해야(`port.find("can")==0`) 잡고, vcan fallback이 없으며 `activateCanPort`가 무조건 bitrate를 설정함. 컨트롤러 수정 대신 SIL 쪽 이름만 `can*`로 바꿔 우회. 인터페이스를 setup이 먼저 UP시켜 두면 컨트롤러는 이미 UP인 포트의 `activateCanPort`(bitrate)를 건너뛰므로 vcan에 bitrate 거는 문제도 회피됨. `modprobe vcan`과 `ip link add ... type vcan`은 그대로(타입은 여전히 vcan, 이름만 can). `mapping.py`의 `CAN_BUS_MOTORS` 키도 같이 바꿔야 `simul.py`의 TMotor/Maxon 버스 분리(키 대조)가 유지됨. 주의: 실제 CAN 하드웨어가 있는 환경에선 `can0` 이름 충돌 위험 → SIL 전용. (이 머신 `shy`는 `can_ports.json`상 real CAN 없음.)
+
 ## 2026-06-23
 - 11:27 KST (UTC+9) — [조사 종료/revert] "SIL에서만 목이 팔보다 먼저 까닥" 장기 조사 마무리, 실험 코드 전부 되돌림
   - 수정 파일: (revert) `simul.py`, `sil/decoder.py` — git checkout으로 HEAD 복원

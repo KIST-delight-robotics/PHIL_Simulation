@@ -37,7 +37,7 @@ setup_can() {
     sudo modprobe vcan
 
     for index in 0 1 2 3; do
-        iface="vcan${index}"
+        iface="can${index}"
         if ! ip link show "${iface}" >/dev/null 2>&1; then
             sudo ip link add dev "${iface}" type vcan
         fi
@@ -104,7 +104,7 @@ require_cmd socat
 setup_can
 setup_dxl
 
-echo "[SIL] vcan0..3 are up"
+echo "[SIL] can0..3 are up"
 echo "[SIL] DXL endpoint for DrumRobot2: ${DXL_DEV}"
 echo "[SIL] DXL endpoint for simulator: ${DXL_PEER}"
 echo "[SIL] leave this terminal open to keep the DXL PTY alive"

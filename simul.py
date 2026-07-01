@@ -80,7 +80,7 @@ class FrameSimulator:
         self.nmt_state = NmtState()
         self.bus_map: Dict[str, object] = {}
         self.motor_bus: Dict[str, str] = self._default_motor_bus()
-        # TMotor는 vcan0/vcan1에만, Maxon은 vcan2/vcan3에만 있다.
+        # TMotor는 can0/can1에만, Maxon은 can2/can3에만 있다.
         # TMotor 전용 버스는 별도 responder thread가 recv+echo를 맡고,
         # Maxon 버스는 main loop의 _poll_can이 계속 처리한다.
         self.tmotor_buses = [
@@ -482,7 +482,7 @@ class FrameSimulator:
             self.step_accum -= PHYSICS_TIMESTEP
 
     # TMotor responder thread
-    # PyBullet step에 막히는 main loop와 달리, TMotor 버스(vcan0/vcan1)의 recv+echo를
+    # PyBullet step에 막히는 main loop와 달리, TMotor 버스(can0/can1)의 recv+echo를
     # 전용 thread로 분리해 DrumRobot2의 current feedback이 step 지연에도 신선하게 유지되도록 한다.
     def _start_tmotor_thread(self) -> None:
         if not self.tmotor_buses:
@@ -617,7 +617,7 @@ def parse_args() -> argparse.Namespace:
         default=200.0,
         help="TMotor idle/discovery status rate.",
     )
-    parser.add_argument("can_buses", nargs="*", default=["vcan0", "vcan1", "vcan2", "vcan3"])
+    parser.add_argument("can_buses", nargs="*", default=["can0", "can1", "can2", "can3"])
     return parser.parse_args()
 
 

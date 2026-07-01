@@ -5,6 +5,7 @@ __pycache__/
 sil/__pycache__/
 artifacts/*.ppm
 *.log
+apply_timing_*
 
 # 로컬 전용 — 에이전트는 디스크에서 읽되 원격엔 올리지 않는다
 AGENTS.md

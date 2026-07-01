@@ -159,11 +159,11 @@ def _pedal_pos(side: str):
 
 
 def _load_drum_positions() -> list:
+    # Vendored locally so the SIL has no cross-repo dependency on the controller tree.
+    # Layout: 6 rows (right xyz, left xyz) x 10 instrument columns, world frame (z-up).
     drum_pos_path = (
-        Path(__file__).resolve().parents[2]
-        / "DrumRobot2"
-        / "include"
-        / "drum"
+        Path(__file__).resolve().parents[1]
+        / "assets"
         / "drum_position.txt"
     )
     if not drum_pos_path.exists():

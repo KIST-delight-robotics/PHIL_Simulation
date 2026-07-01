@@ -42,10 +42,10 @@ DXL_MOTORS: Dict[int, str] = {
 
 # Bus layout
 CAN_BUS_MOTORS: Dict[str, Tuple[str, ...]] = {
-    "vcan0": ("L_arm1", "L_arm2", "L_arm3", "waist"),
-    "vcan1": ("R_arm1", "R_arm2", "R_arm3"),
-    "vcan2": ("L_foot", "R_foot"),
-    "vcan3": ("L_wrist", "R_wrist"),
+    "can0": ("L_arm1", "L_arm2", "L_arm3", "waist"),
+    "can1": ("R_arm1", "R_arm2", "R_arm3"),
+    "can2": ("L_foot", "R_foot"),
+    "can3": ("L_wrist", "R_wrist"),
 }
 
 
@@ -101,7 +101,7 @@ PEDAL_SPEC: dict = {
     "max_tilt_deg": 28.0,
 }
 
-DRUM_PAD_OFFSET: tuple = (0.0, 0.0, -0.03)
+DRUM_PAD_OFFSET: tuple = (0.0, 0.0, -0.1)
 
 DRUM_PAD_SPEC: dict = {
     "height": 0.006,
